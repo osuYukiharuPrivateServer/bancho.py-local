@@ -1,4 +1,5 @@
-""" osu: handle connections from web, api, and beyond? """
+"""osu: handle connections from web, api, and beyond?"""
+
 from __future__ import annotations
 
 import copy
@@ -645,6 +646,28 @@ def decrypt_score_aes_data(
     return score_data, client_hash_decoded
 
 
+# PHP modular submitter uses a different key/format; add compatibility.
+PHP_SUBMIT_KEY = "h89f2-890h2h89b34g-h80g134n90133"
+
+
+def decrypt_php_score_data(score_data_b64: bytes, iv_b64: bytes) -> list[str]:
+    """Decrypt score data produced by osu-submit-modular.php style submitters."""
+    aes = RijndaelCbc(
+        key=PHP_SUBMIT_KEY.encode(),
+        iv=b64decode(iv_b64),
+        padding=Pkcs7Padding(32),
+        block_size=32,
+    )
+
+    # try base64-decoded ciphertext first, fall back to raw bytes
+    try:
+        decrypted = aes.decrypt(b64decode(score_data_b64)).decode()
+    except Exception:
+        decrypted = aes.decrypt(score_data_b64).decode()
+
+    return decrypted.split(":")
+
+
 @router.post("/web/osu-submit-modular-selector.php")
 async def osuSubmitModularSelector(
     request: Request,
@@ -1050,9 +1073,7 @@ async def osuSubmitModularSelector(
             top_100_pp = best_scores[:100]
 
             # calculate new total weighted accuracy
-            weighted_acc = sum(
-                row["acc"] * 0.95**i for i, row in enumerate(top_100_pp)
-            )
+            weighted_acc = sum(row["acc"] * 0.95**i for i, row in enumerate(top_100_pp))
             bonus_acc = 100.0 / (20 * (1 - 0.95**total_scores))
             stats.acc = (weighted_acc * bonus_acc) / 100
 
@@ -1214,6 +1235,196 @@ async def getReplay(
         app.state.loop.create_task(score.increment_replay_views())
 
     return FileResponse(file)
+
+
+@router.post("/web/osu-submit-modular.php")
+async def osuSubmitModularPhp(
+    request: Request,
+    db_conn: databases.core.Connection = Depends(acquire_db_conn),
+):
+    """Compatibility endpoint for third-party PHP modular submitters (osu-submit-modular.php).
+
+    Expected form fields (from the PHP submitter):
+    - iv: base64 iv
+    - score: encrypted score payload (and optional uploaded replay file under the same 'score' name)
+    - pass: md5 password
+    - ft: fail time (optional)
+    - x: exit flag (optional)
+    """
+    form = await request.form()
+
+    # extract 'score' multipart parts (ciphertext + optional replay file)
+    score_parts = form.getlist("score") if "score" in form else []
+    if not score_parts:
+        return b"error: invalid"
+
+    # first part should be the encrypted score payload
+    score_data_b64 = (
+        score_parts[0].encode()
+        if isinstance(score_parts[0], str)
+        else bytes(score_parts[0])
+    )
+
+    # optional replay file
+    replay_file = None
+    if len(score_parts) > 1:
+        replay_file = score_parts[1]
+
+    iv_b64 = form.get("iv")
+    pass_md5 = form.get("pass")
+    ft = form.get("ft")
+
+    if not iv_b64 or not pass_md5:
+        return b"error: invalid"
+
+    try:
+        score_data = decrypt_php_score_data(score_data_b64, iv_b64.encode())
+    except Exception:
+        log("Failed to decrypt php modular score data", Ansi.LRED)
+        return b"error: invalid"
+
+    # basic sanity checks
+    bmap_md5 = score_data[0]
+    if not (bmap := await Beatmap.from_md5(bmap_md5)):
+        return b"error: beatmap"
+
+    username = score_data[1].rstrip()
+
+    # verify user exists and password matches (check DB directly)
+    row = await db_conn.fetch_one(
+        "SELECT id, pw_bcrypt FROM users WHERE name = :name",
+        {"name": username},
+    )
+
+    if not row:
+        return b"error: nouser"
+
+    pw_bcrypt = row["pw_bcrypt"]
+    key = pw_bcrypt.encode() if isinstance(pw_bcrypt, str) else pw_bcrypt
+
+    # map from bcrypt to md5 is cached
+    try:
+        if app.state.cache.bcrypt[key] != pass_md5.encode():
+            return b"error: pass"
+    except Exception:
+        return b"error: pass"
+
+    # fetch a Player object for the user
+    if not (
+        player := await app.state.sessions.players.from_login(
+            username, pass_md5, sql=True
+        )
+    ):
+        # fallback if from_login somehow failed
+        return b"error: pass"
+
+    if player.restricted:
+        return b"error: ban"
+
+    # parse the score payload and create Score
+    score = Score.from_submission(score_data[2:])
+    score.bmap = bmap
+    score.player = player
+
+    # compute derived fields
+    score.acc = score.calculate_accuracy()
+
+    if score.bmap:
+        osu_file_path = BEATMAPS_PATH / f"{score.bmap.id}.osu"
+        if await ensure_local_osu_file(osu_file_path, score.bmap.id, score.bmap.md5):
+            score.pp, score.sr = score.calculate_performance(osu_file_path)
+
+            if score.passed:
+                await score.calculate_status()
+
+                if score.bmap.status != RankedStatus.Pending:
+                    score.rank = await score.calculate_placement()
+            else:
+                score.status = SubmissionStatus.FAILED
+    else:
+        score.pp = score.sr = 0.0
+        if score.passed:
+            score.status = SubmissionStatus.SUBMITTED
+        else:
+            score.status = SubmissionStatus.FAILED
+
+    # update player activity
+    score.player.update_latest_activity_soon()
+
+    if score.mode != score.player.status.mode:
+        score.player.status.mods = score.mods
+        score.player.status.mode = score.mode
+
+        if not score.player.restricted:
+            app.state.sessions.players.enqueue(app.packets.user_stats(score.player))
+
+    # duplicate check
+    if await db_conn.fetch_one(
+        "SELECT 1 FROM scores WHERE online_checksum = :checksum",
+        {"checksum": score.client_checksum},
+    ):
+        log(f"{score.player} submitted a duplicate score.", Ansi.LYELLOW)
+        return b"error: no"
+
+    # set elapsed time if provided (ft)
+    try:
+        score.time_elapsed = int(ft) if ft is not None else 0
+    except Exception:
+        score.time_elapsed = 0
+
+    # insert into db (reuse insertion from the main handler)
+    score.id = await db_conn.execute(
+        "INSERT INTO scores "
+        "VALUES (NULL, "
+        ":map_md5, :score, :pp, :acc, "
+        ":max_combo, :mods, :n300, :n100, "
+        ":n50, :nmiss, :ngeki, :nkatu, "
+        ":grade, :status, :mode, :play_time, "
+        ":time_elapsed, :client_flags, :user_id, :perfect, "
+        ":checksum)",
+        {
+            "map_md5": score.bmap.md5,
+            "score": score.score,
+            "pp": score.pp,
+            "acc": score.acc,
+            "max_combo": score.max_combo,
+            "mods": score.mods,
+            "n300": score.n300,
+            "n100": score.n100,
+            "n50": score.n50,
+            "nmiss": score.nmiss,
+            "ngeki": score.ngeki,
+            "nkatu": score.nkatu,
+            "grade": score.grade.name,
+            "status": score.status,
+            "mode": score.mode,
+            "play_time": score.server_time,
+            "time_elapsed": score.time_elapsed,
+            "client_flags": score.client_flags,
+            "user_id": score.player.id,
+            "perfect": score.perfect,
+            "checksum": score.client_checksum,
+        },
+    )
+
+    # store replay if present
+    if replay_file and score.passed:
+        replay_data = await replay_file.read()
+
+        if len(replay_data) < 24 and not score.player.restricted:
+            log(f"{score.player} submitted a score without a replay!", Ansi.LRED)
+            await score.player.restrict(
+                admin=app.state.sessions.bot,
+                reason="submitted score with no replay",
+            )
+
+            if score.player.online:
+                score.player.logout()
+        else:
+            replay_file_path = REPLAYS_PATH / f"{score.id}.osr"
+            replay_file_path.write_bytes(replay_data)
+
+    return b"ok"
 
 
 @router.get("/web/osu-rate.php")
